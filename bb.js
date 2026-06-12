@@ -1,270 +1,239 @@
-(function() {
+(function () {
     'use strict';
 
-    const PLUGIN = {
-        id: 'stable_adblock',
-        name: 'Stable AdBlock',
-        version: '2.0.0',
-        description: 'Безопасный блокировщик рекламы без агрессивных мутаций'
-    };
+    const log = (...a) => console.log('[ULTRA-ADB]', ...a);
 
-    // ============================================================
-    // КОНФИГУРАЦИЯ (правится без переписывания логики)
-    // ============================================================
-    const CONFIG = {
-        // Паттерны URL, которые считаем рекламными
-        adUrlPatterns: [
-            /\/advert/i,
-            /\/preroll/i,
-            /\/vast/i,
-            /\/vmap/i,
-            /\/ad-manager/i,
-            /\/ads\?/i,
-            /doubleclick/i,
-            /adriver/i,
-            /banner/i,
-            /\/ad\./i,
-            /\/ad-/i
-        ],
-        // DOM-селекторы, которые безопасно удалить
-        safeDomSelectors: [
-            '[class*="preroll"]',
-            '[class*="advert"]',
-            '[id*="preroll"]',
-            '[id*="advert"]',
-            'div[data-ad]',
-            '.ad-container'
-        ],
-        // Интервал очистки DOM (мс)
-        domCleanInterval: 2000,
-        // Включать ли fetch-патч
-        blockFetchAds: true,
-        // Включать ли DOM-очистку
-        cleanDom: true
-    };
+    const AD_KEYWORDS = [
+        'ad', 'ads', 'preroll', 'midroll', 'postroll',
+        'vast', 'vmap', 'banner', 'doubleclick', 'googlead'
+    ];
 
-    // ============================================================
-    // СОСТОЯНИЕ
-    // ============================================================
-    let originalFetch = null;
-    let domCleanerId = null;
-    let isActive = false;
+    const isAdHint = (s = '') =>
+        AD_KEYWORDS.some(k => s.toLowerCase().includes(k));
 
-    // ============================================================
-    // БЕЗОПАСНЫЙ FAKE RESPONSE (контракт соблюден)
-    // ============================================================
-    function createSafeEmptyResponse(url) {
-        const body = JSON.stringify({ ads: [], preroll: null, vast: '' });
-        const blob = new Blob([body], { type: 'application/json' });
-        
-        return new Response(blob, {
-            status: 200,
-            statusText: 'OK',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-AdBlocked': 'true',
-                'Content-Length': blob.size.toString()
+    // =========================================================
+    // 1. FETCH LAYER (PRO + ULTRA merge)
+    // =========================================================
+    const origFetch = window.fetch;
+
+    window.fetch = async function (...args) {
+        const res = await origFetch.apply(this, args);
+
+        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+
+        if (!url) return res;
+
+        try {
+            const ct = res.headers.get('content-type') || '';
+
+            // =========================
+            // VAST / VMAP (PRO LAYER)
+            // =========================
+            if (isAdHint(url) || ct.includes('xml')) {
+                const text = await res.clone().text();
+
+                if (text.includes('<VAST') || text.includes('<VMAP')) {
+                    log('BLOCK VAST/VMAP:', url);
+
+                    return new Response('<VAST version="3.0"></VAST>', {
+                        headers: { 'Content-Type': 'application/xml' }
+                    });
+                }
+
+                // VMAP ad break removal
+                if (text.includes('<VMAP')) {
+                    return new Response('<VMAP></VMAP>', {
+                        headers: { 'Content-Type': 'application/xml' }
+                    });
+                }
             }
-        });
-    }
 
-    // ============================================================
-    // FETCH PATCH (точечный, без цепочечного перехвата)
-    // ============================================================
-    function isAdRequest(url) {
-        if (!url || typeof url !== 'string') return false;
-        return CONFIG.adUrlPatterns.some(pattern => pattern.test(url));
-    }
+            // =========================
+            // JSON ADS (PRO LAYER)
+            // =========================
+            if (ct.includes('json')) {
+                const json = await res.clone().json().catch(() => null);
 
-    function patchedFetch(input, init) {
-        const url = typeof input === 'string' 
-            ? input 
-            : (input?.url || '');
+                if (json && (json.ads || json.preroll || json.vast)) {
+                    log('BLOCK JSON ADS:', url);
 
-        if (isAdRequest(url)) {
-            console.log(`[${PLUGIN.name}] blocked fetch:`, url.substring(0, 80));
-            return Promise.resolve(createSafeEmptyResponse(url));
-        }
+                    return new Response(JSON.stringify({
+                        ads: [],
+                        preroll: null,
+                        midroll: null,
+                        vast: null
+                    }), {
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+            }
 
-        // Пробрасываем в оригинальный fetch
-        return originalFetch.call(window, input, init);
-    }
+            // =========================
+            // ULTRA LAYER: HLS MANIFEST ANALYSIS
+            // =========================
+            if (url.includes('.m3u8')) {
+                const text = await res.clone().text();
 
-    function installFetchPatch() {
-        if (!CONFIG.blockFetchAds) return;
-        if (originalFetch) return; // уже установлен
-        
-        originalFetch = window.fetch;
-        window.fetch = patchedFetch;
-        console.log(`[${PLUGIN.name}] fetch patch installed`);
-    }
+                if (!text.includes('#EXTM3U')) return res;
 
-    function uninstallFetchPatch() {
-        if (originalFetch) {
-            window.fetch = originalFetch;
-            originalFetch = null;
-            console.log(`[${PLUGIN.name}] fetch patch removed`);
-        }
-    }
+                const lines = text.split('\n');
 
-    // ============================================================
-    // DOM OBSERVER (без mutation, только safe remove)
-    // ============================================================
-    function cleanAdElements() {
-        if (!CONFIG.cleanDom) return;
-        
-        let removed = 0;
-        CONFIG.safeDomSelectors.forEach(selector => {
-            try {
-                const elements = document.querySelectorAll(selector);
-                elements.forEach(el => {
-                    // Проверяем, что элемент не содержит видео-контент
-                    const hasVideo = el.querySelector('video');
-                    const isPlayerContainer = el.classList?.contains('player') || 
-                                              el.id?.includes('player');
-                    
-                    if (!hasVideo && !isPlayerContainer) {
-                        el.remove();
-                        removed++;
+                let cleaned = [];
+                let skipNextSegment = false;
+
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+
+                    // EXTINF contains duration metadata
+                    if (line.startsWith('#EXTINF')) {
+                        const next = lines[i + 1] || '';
+
+                        // ULTRA HEURISTIC:
+                        // ads often:
+                        // - very short segments (<3–5 sec)
+                        // - named ad-like
+                        const durationMatch = line.match(/#EXTINF:([\d.]+)/);
+                        const duration = durationMatch ? parseFloat(durationMatch[1]) : 999;
+
+                        const isAdSegment =
+                            duration < 3.5 ||
+                            isAdHint(next) ||
+                            isAdHint(line);
+
+                        if (isAdSegment) {
+                            log('DROP SEGMENT:', duration, next);
+                            skipNextSegment = true;
+                            continue;
+                        }
+                    }
+
+                    if (skipNextSegment) {
+                        skipNextSegment = false;
+                        continue;
+                    }
+
+                    cleaned.push(line);
+                }
+
+                return new Response(cleaned.join('\n'), {
+                    headers: {
+                        'Content-Type': 'application/vnd.apple.mpegurl'
                     }
                 });
-            } catch (e) {
-                // Селектор невалидный — пропускаем
-            }
-        });
-        
-        if (removed > 0) {
-            console.log(`[${PLUGIN.name}] DOM cleaned: ${removed} elements`);
-        }
-    }
-
-    function startDomCleaner() {
-        if (domCleanerId) return;
-        cleanAdElements(); // первый прогон сразу
-        domCleanerId = setInterval(cleanAdElements, CONFIG.domCleanInterval);
-    }
-
-    function stopDomCleaner() {
-        if (domCleanerId) {
-            clearInterval(domCleanerId);
-            domCleanerId = null;
-        }
-    }
-
-    // ============================================================
-    // PLAYER STATE OBSERVER (read-only, без мутаций)
-    // ============================================================
-    function setupPlayerObserver() {
-        // Ждем появления плеера и наблюдаем за его состоянием
-        // НЕ мутируем — только форсируем skip если видим ad state
-        const checkInterval = setInterval(() => {
-            if (!isActive) {
-                clearInterval(checkInterval);
-                return;
             }
 
-            try {
-                const player = window.Player || window.player || window.videoPlayer;
-                if (!player) return;
+        } catch (e) {}
 
-                // Если плеер в состоянии рекламы — пробуем пропустить
-                if (typeof player.skipAd === 'function' && player.isInAd?.()) {
-                    player.skipAd();
-                    console.log(`[${PLUGIN.name}] ad skipped via player API`);
-                }
-
-                // Если есть видео-элемент с src содержащим ad
-                const video = document.querySelector('video');
-                if (video && video.src && isAdRequest(video.src)) {
-                    video.src = '';
-                    video.load();
-                }
-            } catch (e) {
-                // Игнорируем ошибки доступа к плееру
-            }
-        }, 1000);
-
-        return checkInterval;
-    }
-
-    // ============================================================
-    // УПРАВЛЕНИЕ ПЛАГИНОМ
-    // ============================================================
-    function enable() {
-        if (isActive) return;
-        isActive = true;
-
-        installFetchPatch();
-        startDomCleaner();
-        const observerInterval = setupPlayerObserver();
-
-        // Сохраняем ссылку на observer для cleanup
-        PLUGIN._observerInterval = observerInterval;
-
-        console.log(`[${PLUGIN.name}] enabled v${PLUGIN.version}`);
-    }
-
-    function disable() {
-        if (!isActive) return;
-        isActive = false;
-
-        uninstallFetchPatch();
-        stopDomCleaner();
-        
-        if (PLUGIN._observerInterval) {
-            clearInterval(PLUGIN._observerInterval);
-            PLUGIN._observerInterval = null;
-        }
-
-        console.log(`[${PLUGIN.name}] disabled`);
-    }
-
-    function toggle() {
-        isActive ? disable() : enable();
-    }
-
-    // ============================================================
-    // РЕГИСТРАЦИЯ В LAMPA
-    // ============================================================
-    function register() {
-        if (window.Lampa) {
-            // Регистрируем в системе плагинов Lampa
-            if (window.plugin_manager) {
-                window.plugin_manager.add({
-                    ...PLUGIN,
-                    enable,
-                    disable,
-                    toggle
-                });
-            }
-
-            // Автостарт при загрузке Lampa
-            if (window.Lampa.Listener) {
-                window.Lampa.Listener.follow('loaded', () => {
-                    enable();
-                });
-            } else {
-                // Lampa еще не инициализирована — стартуем сразу
-                enable();
-            }
-        } else {
-            // Lampa может загрузиться позже
-            window.addEventListener('DOMContentLoaded', enable);
-        }
-    }
-
-    // ============================================================
-    // ПУБЛИЧНОЕ API (для дебага)
-    // ============================================================
-    window.StableAdBlock = {
-        enable,
-        disable,
-        toggle,
-        isActive: () => isActive,
-        config: CONFIG,
-        plugin: PLUGIN
+        return res;
     };
 
-    // Старт
-    register();
+    // =========================================================
+    // 2. XHR (PRO LAYER KEEP)
+    // =========================================================
+    const origXHROpen = XMLHttpRequest.prototype.open;
+    const origXHRSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (m, url) {
+        this._url = url;
+        return origXHROpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+        if (this._url && isAdHint(this._url)) {
+            log('XHR BLOCK:', this._url);
+            this.abort();
+            return;
+        }
+        return origXHRSend.apply(this, arguments);
+    };
+
+    // =========================================================
+    // 3. DOM ULTRA CLEANER (STREAM SAFE)
+    // =========================================================
+    const observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            for (const n of m.addedNodes) {
+                if (!(n instanceof HTMLElement)) continue;
+
+                const html = (n.outerHTML || '').toLowerCase();
+
+                if (isAdHint(html)) {
+                    log('DOM KILL:', n);
+                    n.remove();
+                }
+            }
+        }
+    });
+
+    observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true
+    });
+
+    // =========================================================
+    // 4. VIDEO STREAM ULTRA ENGINE
+    // =========================================================
+    setInterval(() => {
+        const video = document.querySelector('video');
+        if (!video) return;
+
+        // CASE 1: ad URL
+        if (isAdHint(video.src)) {
+            log('VIDEO SRC KILL');
+            video.pause();
+            video.removeAttribute('src');
+            video.load();
+        }
+
+        // CASE 2: SSAI heuristic (IMPORTANT ULTRA PART)
+        // sudden duration reset + very short burst patterns
+        if (video.duration && video.currentTime === 0 && video.readyState >= 2) {
+            if (video.duration < 6) {
+                log('ULTRA HEURISTIC AD DROP');
+                video.currentTime = video.duration;
+            }
+        }
+
+        // CASE 3: forced ad playback detection
+        const player = window.player || window.Player || window.videoPlayer;
+
+        try {
+            if (player?.isInAd?.()) {
+                player.skipAd?.();
+                log('PLAYER SKIP');
+            }
+        } catch (e) {}
+    }, 700);
+
+    // =========================================================
+    // 5. NETWORK BEACON / TRACKING BLOCK (PRO EXTENSION)
+    // =========================================================
+    if (navigator.sendBeacon) {
+        const orig = navigator.sendBeacon.bind(navigator);
+        navigator.sendBeacon = function (url, data) {
+            if (isAdHint(url)) {
+                log('BEACON BLOCK:', url);
+                return true;
+            }
+            return orig(url, data);
+        };
+    }
+
+    // =========================================================
+    // 6. CSS LEVEL KILL (hidden ad containers)
+    // =========================================================
+    const style = document.createElement('style');
+    style.innerHTML = `
+        [class*="ad"], [id*="ad"],
+        [class*="banner"], iframe[src*="ad"],
+        .video-ads, .preroll, .midroll {
+            visibility: hidden !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            height: 0 !important;
+        }
+    `;
+    document.head.appendChild(style);
+
+    log('ULTRA + PRO AdBlock ACTIVE');
 })();
