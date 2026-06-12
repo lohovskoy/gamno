@@ -1,239 +1,224 @@
-(function () {
+(function (Lampa) {
     'use strict';
 
-    const log = (...a) => console.log('[ULTRA-ADB]', ...a);
+    var NAME = 'HARD ENGINE';
 
-    const AD_KEYWORDS = [
+    function log() {
+        console.log('[' + NAME + ']', arguments);
+    }
+
+    // =========================================================
+    // ADVANCED AD DETECTION
+    // =========================================================
+    var ADS = [
         'ad', 'ads', 'preroll', 'midroll', 'postroll',
-        'vast', 'vmap', 'banner', 'doubleclick', 'googlead'
+        'vast', 'vmap', 'doubleclick', 'googlesyndication',
+        'googlead', 'adservice', 'banner', 'tracking'
     ];
 
-    const isAdHint = (s = '') =>
-        AD_KEYWORDS.some(k => s.toLowerCase().includes(k));
+    function isAd(str) {
+        if (!str) return false;
+        str = String(str).toLowerCase();
 
-    // =========================================================
-    // 1. FETCH LAYER (PRO + ULTRA merge)
-    // =========================================================
-    const origFetch = window.fetch;
-
-    window.fetch = async function (...args) {
-        const res = await origFetch.apply(this, args);
-
-        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
-
-        if (!url) return res;
-
-        try {
-            const ct = res.headers.get('content-type') || '';
-
-            // =========================
-            // VAST / VMAP (PRO LAYER)
-            // =========================
-            if (isAdHint(url) || ct.includes('xml')) {
-                const text = await res.clone().text();
-
-                if (text.includes('<VAST') || text.includes('<VMAP')) {
-                    log('BLOCK VAST/VMAP:', url);
-
-                    return new Response('<VAST version="3.0"></VAST>', {
-                        headers: { 'Content-Type': 'application/xml' }
-                    });
-                }
-
-                // VMAP ad break removal
-                if (text.includes('<VMAP')) {
-                    return new Response('<VMAP></VMAP>', {
-                        headers: { 'Content-Type': 'application/xml' }
-                    });
-                }
-            }
-
-            // =========================
-            // JSON ADS (PRO LAYER)
-            // =========================
-            if (ct.includes('json')) {
-                const json = await res.clone().json().catch(() => null);
-
-                if (json && (json.ads || json.preroll || json.vast)) {
-                    log('BLOCK JSON ADS:', url);
-
-                    return new Response(JSON.stringify({
-                        ads: [],
-                        preroll: null,
-                        midroll: null,
-                        vast: null
-                    }), {
-                        headers: { 'Content-Type': 'application/json' }
-                    });
-                }
-            }
-
-            // =========================
-            // ULTRA LAYER: HLS MANIFEST ANALYSIS
-            // =========================
-            if (url.includes('.m3u8')) {
-                const text = await res.clone().text();
-
-                if (!text.includes('#EXTM3U')) return res;
-
-                const lines = text.split('\n');
-
-                let cleaned = [];
-                let skipNextSegment = false;
-
-                for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i];
-
-                    // EXTINF contains duration metadata
-                    if (line.startsWith('#EXTINF')) {
-                        const next = lines[i + 1] || '';
-
-                        // ULTRA HEURISTIC:
-                        // ads often:
-                        // - very short segments (<3–5 sec)
-                        // - named ad-like
-                        const durationMatch = line.match(/#EXTINF:([\d.]+)/);
-                        const duration = durationMatch ? parseFloat(durationMatch[1]) : 999;
-
-                        const isAdSegment =
-                            duration < 3.5 ||
-                            isAdHint(next) ||
-                            isAdHint(line);
-
-                        if (isAdSegment) {
-                            log('DROP SEGMENT:', duration, next);
-                            skipNextSegment = true;
-                            continue;
-                        }
-                    }
-
-                    if (skipNextSegment) {
-                        skipNextSegment = false;
-                        continue;
-                    }
-
-                    cleaned.push(line);
-                }
-
-                return new Response(cleaned.join('\n'), {
-                    headers: {
-                        'Content-Type': 'application/vnd.apple.mpegurl'
-                    }
-                });
-            }
-
-        } catch (e) {}
-
-        return res;
-    };
-
-    // =========================================================
-    // 2. XHR (PRO LAYER KEEP)
-    // =========================================================
-    const origXHROpen = XMLHttpRequest.prototype.open;
-    const origXHRSend = XMLHttpRequest.prototype.send;
-
-    XMLHttpRequest.prototype.open = function (m, url) {
-        this._url = url;
-        return origXHROpen.apply(this, arguments);
-    };
-
-    XMLHttpRequest.prototype.send = function () {
-        if (this._url && isAdHint(this._url)) {
-            log('XHR BLOCK:', this._url);
-            this.abort();
-            return;
+        for (var i = 0; i < ADS.length; i++) {
+            if (str.indexOf(ADS[i]) !== -1) return true;
         }
-        return origXHRSend.apply(this, arguments);
-    };
+        return false;
+    }
 
     // =========================================================
-    // 3. DOM ULTRA CLEANER (STREAM SAFE)
+    // FETCH LAYER (AGGRESSIVE BLOCK)
     // =========================================================
-    const observer = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-            for (const n of m.addedNodes) {
-                if (!(n instanceof HTMLElement)) continue;
+    function patchFetch() {
+        if (!window.fetch) return;
 
-                const html = (n.outerHTML || '').toLowerCase();
+        var _fetch = window.fetch;
 
-                if (isAdHint(html)) {
-                    log('DOM KILL:', n);
-                    n.remove();
-                }
+        window.fetch = function () {
+            var args = arguments;
+
+            var url = '';
+            try {
+                url = typeof args[0] === 'string'
+                    ? args[0]
+                    : (args[0] && args[0].url ? args[0].url : '');
+            } catch (e) {}
+
+            if (url && isAd(url)) {
+                log('BLOCK FETCH', url);
+                return Promise.resolve(new Response('', { status: 204 }));
             }
-        }
-    });
 
-    observer.observe(document.documentElement, {
-        childList: true,
-        subtree: true
-    });
-
-    // =========================================================
-    // 4. VIDEO STREAM ULTRA ENGINE
-    // =========================================================
-    setInterval(() => {
-        const video = document.querySelector('video');
-        if (!video) return;
-
-        // CASE 1: ad URL
-        if (isAdHint(video.src)) {
-            log('VIDEO SRC KILL');
-            video.pause();
-            video.removeAttribute('src');
-            video.load();
-        }
-
-        // CASE 2: SSAI heuristic (IMPORTANT ULTRA PART)
-        // sudden duration reset + very short burst patterns
-        if (video.duration && video.currentTime === 0 && video.readyState >= 2) {
-            if (video.duration < 6) {
-                log('ULTRA HEURISTIC AD DROP');
-                video.currentTime = video.duration;
-            }
-        }
-
-        // CASE 3: forced ad playback detection
-        const player = window.player || window.Player || window.videoPlayer;
-
-        try {
-            if (player?.isInAd?.()) {
-                player.skipAd?.();
-                log('PLAYER SKIP');
-            }
-        } catch (e) {}
-    }, 700);
-
-    // =========================================================
-    // 5. NETWORK BEACON / TRACKING BLOCK (PRO EXTENSION)
-    // =========================================================
-    if (navigator.sendBeacon) {
-        const orig = navigator.sendBeacon.bind(navigator);
-        navigator.sendBeacon = function (url, data) {
-            if (isAdHint(url)) {
-                log('BEACON BLOCK:', url);
-                return true;
-            }
-            return orig(url, data);
+            return _fetch.apply(this, args);
         };
     }
 
     // =========================================================
-    // 6. CSS LEVEL KILL (hidden ad containers)
+    // XHR LAYER
     // =========================================================
-    const style = document.createElement('style');
-    style.innerHTML = `
-        [class*="ad"], [id*="ad"],
-        [class*="banner"], iframe[src*="ad"],
-        .video-ads, .preroll, .midroll {
-            visibility: hidden !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-            height: 0 !important;
-        }
-    `;
-    document.head.appendChild(style);
+    function patchXHR() {
+        var open = XMLHttpRequest.prototype.open;
+        var send = XMLHttpRequest.prototype.send;
 
-    log('ULTRA + PRO AdBlock ACTIVE');
-})();
+        XMLHttpRequest.prototype.open = function (m, url) {
+            this._url = url;
+            return open.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.send = function () {
+            if (this._url && isAd(this._url)) {
+                log('BLOCK XHR', this._url);
+                try { this.abort(); } catch (e) {}
+                return;
+            }
+            return send.apply(this, arguments);
+        };
+    }
+
+    // =========================================================
+    // BEACON BLOCK (TRACKING KILL)
+    // =========================================================
+    function patchBeacon() {
+        if (!navigator.sendBeacon) return;
+
+        var orig = navigator.sendBeacon;
+
+        navigator.sendBeacon = function (url, data) {
+            if (isAd(url)) {
+                log('BLOCK BEACON', url);
+                return true;
+            }
+            return orig.apply(navigator, arguments);
+        };
+    }
+
+    // =========================================================
+    // VIDEO CONTROL (SAFE AGGRESSIVE)
+    // =========================================================
+    function watchVideo() {
+        setInterval(function () {
+
+            var v = document.querySelector('video');
+            if (!v) return;
+
+            try {
+
+                // 1. obvious ad source
+                if (v.src && isAd(v.src)) {
+                    log('VIDEO SRC BLOCK');
+                    v.pause();
+                    v.removeAttribute('src');
+                    v.load();
+                }
+
+                // 2. player-level skip
+                var p =
+                    window.player ||
+                    window.Player ||
+                    window.videoPlayer;
+
+                if (p && p.isInAd && p.isInAd()) {
+                    if (p.skipAd) {
+                        p.skipAd();
+                        log('PLAYER SKIP');
+                    }
+                }
+
+            } catch (e) {}
+
+        }, 1000);
+    }
+
+    // =========================================================
+    // DOM CLEANER (MEDIUM AGGRESSIVE)
+    // =========================================================
+    function domClean() {
+
+        var obs = new MutationObserver(function (mutations) {
+
+            for (var i = 0; i < mutations.length; i++) {
+                var nodes = mutations[i].addedNodes;
+
+                for (var j = 0; j < nodes.length; j++) {
+                    var n = nodes[j];
+
+                    if (!n || !n.tagName) continue;
+
+                    var cls = (n.className || '').toString().toLowerCase();
+                    var id = (n.id || '').toLowerCase();
+
+                    if (
+                        cls.indexOf('preroll') !== -1 ||
+                        cls.indexOf('midroll') !== -1 ||
+                        cls.indexOf('advert') !== -1 ||
+                        id.indexOf('ad') !== -1
+                    ) {
+                        try {
+                            n.remove();
+                            log('REMOVE NODE');
+                        } catch (e) {}
+                    }
+                }
+            }
+
+        });
+
+        if (document.documentElement) {
+            obs.observe(document.documentElement, {
+                childList: true,
+                subtree: true
+            });
+        }
+    }
+
+    // =========================================================
+    // CSS BLOCK
+    // =========================================================
+    function css() {
+        if (!document.head) return;
+
+        var style = document.createElement('style');
+
+        style.innerHTML =
+            '.preroll,.midroll,.video-ads,.ads,' +
+            '.advert,.banner{' +
+            'display:none!important;' +
+            'opacity:0!important;' +
+            'pointer-events:none!important;' +
+            '}';
+
+        document.head.appendChild(style);
+    }
+
+    // =========================================================
+    // INIT
+    // =========================================================
+    function init() {
+        log('INIT HARD ENGINE');
+
+        patchFetch();
+        patchXHR();
+        patchBeacon();
+
+        watchVideo();
+        domClean();
+        css();
+    }
+
+    // =========================================================
+    // REGISTER
+    // =========================================================
+    if (window.Lampa && Lampa.Plugin) {
+
+        Lampa.Plugin.add({
+            name: NAME,
+            version: '3.0 HARD',
+            description: 'Aggressive ad blocking without stream breaking',
+            init: init
+        });
+
+    } else {
+        init();
+    }
+
+})(window.Lampa);
