@@ -2,300 +2,321 @@
     'use strict';
 
     var PLUGIN = {
-        name:        'Lampa AdBlock',
-        tag:         'lampa_adblock',
-        version:     '3.0.0',
-        description: 'Блокировка встроенной рекламы Lampa',
+        name: 'Lampa AdBlock Pro',
+        tag: 'lampa_adblock_pro',
+        version: '4.1.0',
+        description: 'Hard patch AdManager / preroll pipeline',
+        enabled: true
     };
 
+    var isPatched = false;
+    var originalFetch = null;
+    var playerHooks = [];
+
     function log(msg) {
-        console.log('[AdBlock] ' + msg);
+        console.log('[AdBlockPro] ' + msg);
     }
 
-    // =========================================================
-    //  1. Подменяем премиум-аккаунт
-    //     Многие рекламные блоки показываются только не-премиум
-    //     пользователям — говорим Lampa что у нас премиум
-    // =========================================================
-    function patchAccount() {
-        window.Account = window.Account || {};
-        window.Account.hasPremium = function () { return true; };
-        window.Account.isPremium  = function () { return true; };
-        window.Account.premium    = true;
-
-        // Lampa может хранить аккаунт и внутри своего неймспейса
-        if (window.Lampa && window.Lampa.Account) {
-            window.Lampa.Account.hasPremium = function () { return true; };
-            window.Lampa.Account.isPremium  = function () { return true; };
-            window.Lampa.Account.premium    = true;
-        }
-
-        log('Account.hasPremium → true');
-    }
-
-    // =========================================================
-    //  2. Proxy на document.createElement
-    //     Когда реклама создаёт <video>, подсовываем фейковый
-    //     элемент который сразу сообщает о завершении
-    // =========================================================
-    function patchCreateElement() {
-        var _realCreate = document.createElement.bind(document);
-        var _adVideoActive = false;
-
-        document.createElement = new Proxy(document.createElement, {
-            apply: function (target, thisArg, args) {
-                var tag = args[0] && args[0].toLowerCase();
-
-                if (tag === 'video') {
-                    // Создаём настоящий video-элемент
-                    var video = target.apply(thisArg, args);
-
-                    // Перехватываем play()
-                    var originalPlay = video.play.bind(video);
-                    video.play = function () {
-                        // Если у видео нет src или src похож на рекламный — глушим
-                        if (!video.src || isAdUrl(video.src)) {
-                            log('Рекламное видео заблокировано (play перехвачен)');
-                            // Эмулируем мгновенное завершение рекламы
-                            setTimeout(function () {
-                                try {
-                                    Object.defineProperty(video, 'ended', { value: true, writable: true });
-                                    video.dispatchEvent(new Event('ended'));
-                                    video.dispatchEvent(new Event('complete'));
-                                } catch (e) {}
-                            }, 200);
-                            return Promise.resolve();
-                        }
-                        return originalPlay();
-                    };
-
-                    // Перехватываем setAttribute('src', ...)
-                    var originalSetAttr = video.setAttribute.bind(video);
-                    video.setAttribute = function (name, value) {
-                        if (name === 'src' && isAdUrl(value)) {
-                            log('Рекламный src заблокирован → ' + value);
-                            return;
-                        }
-                        return originalSetAttr(name, value);
-                    };
-
-                    return video;
-                }
-
-                return target.apply(thisArg, args);
-            }
-        });
-
-        log('document.createElement Proxy установлен');
-    }
-
-    // =========================================================
-    //  3. Глушим network.silent — Lampa получает через него
-    //     список рекламных url / заблокированных доменов
-    // =========================================================
-    function patchNetwork() {
-        var targets = [
-            window.network,
-            window.Lampa && window.Lampa.Network,
-        ].filter(Boolean);
-
-        targets.forEach(function (net) {
-            if (net && typeof net.silent === 'function') {
-                net.silent = function (url, ok) {
-                    log('network.silent → ' + url);
-                    if (typeof ok === 'function') ok([]);
-                };
-                log('network.silent заглушён');
-            }
-        });
-
-        // Ищем network$N в window (минифицированный бандл Lampa)
+    // =========================
+    // УТИЛИТЫ
+    // =========================
+    function createEmptyResponse() {
+        var body = JSON.stringify({ preroll: [], midroll: [], postroll: [] });
+        
         try {
-            Object.keys(window).forEach(function (key) {
-                if (/^network/.test(key)) {
-                    var obj = window[key];
-                    if (obj && typeof obj.silent === 'function') {
-                        obj.silent = function (url, ok) {
-                            log('network.silent (' + key + ') → ' + url);
-                            if (typeof ok === 'function') ok([]);
-                        };
-                        log('Заглушён: ' + key + '.silent');
+            return new Response(body, {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        } catch (e) {
+            // Fallback для старых окружений
+            return {
+                ok: true,
+                status: 200,
+                json: function () { return Promise.resolve({ preroll: [] }); },
+                text: function () { return Promise.resolve(''); }
+            };
+        }
+    }
+
+    function shouldBlockUrl(url) {
+        if (typeof url !== 'string' || !url) return false;
+        
+        // Конкретные домены рекламных сервисов
+        var blockedDomains = [
+            'cub.rip',
+            'adsrv.me',
+            'doubleclick.net',
+            'googlesyndication.com',
+            'adservice.google.com'
+        ];
+        
+        // Конкретные паттерны запросов
+        var blockedPatterns = [
+            '/preroll.json',
+            '/ads.json',
+            '/vmap.xml',
+            '/vast.xml'
+        ];
+        
+        // Проверяем домены
+        for (var i = 0; i < blockedDomains.length; i++) {
+            if (url.indexOf(blockedDomains[i]) !== -1) return true;
+        }
+        
+        // Проверяем паттерны
+        for (var j = 0; j < blockedPatterns.length; j++) {
+            if (url.indexOf(blockedPatterns[j]) !== -1) return true;
+        }
+        
+        return false;
+    }
+
+    // =========================
+    // 1. ПРЯМОЙ ХУК AD MANAGER
+    // =========================
+    function killAdMethods(obj, name) {
+        if (!obj) return false;
+        
+        var patched = false;
+        
+        ['load', 'request', 'get', 'init', 'start'].forEach(function (m) {
+            if (typeof obj[m] === 'function') {
+                var original = obj[m];
+                obj[m] = function () {
+                    log(name + '.' + m + ' → blocked');
+                    return Promise.resolve([]);
+                };
+                // Сохраняем для возможного восстановления
+                obj['_' + m + '_original'] = original;
+                patched = true;
+            }
+        });
+        
+        // Очищаем массивы рекламы
+        try {
+            if (obj.preroll !== undefined) obj.preroll = [];
+            if (obj.midroll !== undefined) obj.midroll = [];
+            if (obj.postroll !== undefined) obj.postroll = [];
+            patched = true;
+        } catch (e) {}
+        
+        return patched;
+    }
+
+    function patchAdManager() {
+        var patched = [];
+        
+        // Прямые неймспейсы
+        var targets = [
+            { obj: window.AdManager, name: 'AdManager' },
+            { obj: window.Lampa && window.Lampa.AdManager, name: 'Lampa.AdManager' }
+        ];
+        
+        targets.forEach(function (target) {
+            if (killAdMethods(target.obj, target.name)) {
+                patched.push(target.name);
+            }
+        });
+        
+        // Эвристический поиск по window
+        Object.keys(window).forEach(function (k) {
+            try {
+                var o = window[k];
+                if (!o || typeof o !== 'object' || k === 'location') return;
+                
+                var hasAdProps = (o.preroll || o.midroll || o.postroll);
+                var hasAdMethods = typeof o.load === 'function' || typeof o.request === 'function';
+                var nameMatches = k.toLowerCase().indexOf('ad') !== -1 || 
+                                 k.toLowerCase().indexOf('preroll') !== -1;
+                
+                if (hasAdProps || (hasAdMethods && nameMatches)) {
+                    if (killAdMethods(o, k)) {
+                        patched.push(k);
                     }
                 }
-            });
-        } catch (e) {}
+            } catch (e) {}
+        });
+        
+        if (patched.length > 0) {
+            log('Patched ad objects: ' + patched.join(', '));
+        } else {
+            log('No ad objects found to patch');
+        }
+        
+        return patched;
     }
 
-    // =========================================================
-    //  4. Пустышка VideoBlock
-    //     Заменяем внутренний класс рекламного блока на заглушку
-    // =========================================================
-    function patchVideoBlock() {
-        function VideoBlockStub() {}
-        VideoBlockStub.prototype.start   = function () { log('VideoBlock.start заблокирован'); };
-        VideoBlockStub.prototype.load    = function () {};
-        VideoBlockStub.prototype.create  = function () {};
-        VideoBlockStub.prototype.stop    = function () {};
-        VideoBlockStub.prototype.destroy = function () {};
-
-        if (window.VideoBlock)                       window.VideoBlock = VideoBlockStub;
-        if (window.Lampa && window.Lampa.VideoBlock) window.Lampa.VideoBlock = VideoBlockStub;
-
-        // Ищем по сигнатуре в window
-        try {
-            Object.keys(window).forEach(function (key) {
-                var obj = window[key];
-                if (
-                    obj && typeof obj === 'function' && obj.prototype &&
-                    typeof obj.prototype.start  === 'function' &&
-                    typeof obj.prototype.load   === 'function' &&
-                    typeof obj.prototype.create === 'function'
-                ) {
-                    window[key] = VideoBlockStub;
-                    log('VideoBlock заменён: ' + key);
-                }
-            });
-        } catch (e) {}
-    }
-
-    // =========================================================
-    //  5. Перехват Storage — говорим что реклама отключена
-    // =========================================================
-    function patchStorage() {
-        if (!window.Lampa || !window.Lampa.Storage) return;
-
-        var AD_KEYS = ['adv', 'advert', 'ad_enable', 'show_ad', 'preroll', 'ad_url'];
-        var orig = window.Lampa.Storage.get;
-
-        window.Lampa.Storage.get = function (key, def) {
-            if (AD_KEYS.indexOf(key) !== -1) {
-                log('Storage.get заблокирован: ' + key);
-                return false;
-            }
-            return orig.apply(this, arguments);
-        };
-
-        log('Lampa.Storage.get перехвачен');
-    }
-
-    // =========================================================
-    //  6. Перехват fetch / XHR
-    // =========================================================
-    var AD_URL_KEYWORDS = [
-        '/preroll', '/advert', '/banner', '/adv',
-        'adriver.ru', 'doubleclick.net',
-        'googlesyndication.com', 'begun.ru', 'smi2',
-    ];
-
-    function isAdUrl(url) {
-        if (!url) return false;
-        var s = String(url).toLowerCase();
-        return AD_URL_KEYWORDS.some(function (kw) { return s.indexOf(kw) !== -1; });
-    }
-
+    // =========================
+    // 2. ПЕРЕХВАТ FETCH
+    // =========================
     function patchFetch() {
-        if (!window.fetch) return;
-        var orig = window.fetch;
-        window.fetch = function (input) {
-            var url = typeof input === 'string' ? input : (input && input.url) || '';
-            if (isAdUrl(url)) {
-                log('fetch заблокирован → ' + url);
-                return Promise.resolve(new Response('[]', { status: 200 }));
+        if (originalFetch) {
+            log('Fetch already patched');
+            return;
+        }
+        
+        if (typeof window.fetch !== 'function') {
+            log('window.fetch not available');
+            return;
+        }
+        
+        originalFetch = window.fetch;
+        
+        window.fetch = function (input, init) {
+            var url = (typeof input === 'string') ? input : (input && input.url) || '';
+            
+            if (PLUGIN.enabled && shouldBlockUrl(url)) {
+                log('fetch blocked → ' + url.substring(0, 80));
+                return Promise.resolve(createEmptyResponse());
             }
-            return orig.apply(this, arguments);
+            
+            return originalFetch.apply(this, arguments);
         };
-        log('fetch перехвачен');
+        
+        log('Fetch patched');
     }
 
-    function patchXHR() {
-        var orig = XMLHttpRequest.prototype.open;
-        XMLHttpRequest.prototype.open = function (method, url) {
-            if (isAdUrl(url)) {
-                log('XHR заблокирован → ' + url);
-                arguments[1] = 'about:blank';
+    // =========================
+    // 3. ПЕРЕХВАТ PLAYER
+    // =========================
+    function patchPlayer() {
+        if (!window.Player) return [];
+        
+        var methods = ['load', 'play', 'startPlayback', 'initPlayer', 'start'];
+        var patched = [];
+        
+        methods.forEach(function (method) {
+            if (typeof window.Player[method] === 'function') {
+                var orig = window.Player[method];
+                
+                window.Player[method] = function () {
+                    log('Player.' + method + ' intercepted');
+                    
+                    try {
+                        // Очищаем рекламные массивы плеера
+                        if (window.Player.preroll !== undefined) {
+                            window.Player.preroll = [];
+                        }
+                        if (window.Player.midroll !== undefined) {
+                            window.Player.midroll = [];
+                        }
+                        if (window.Player.postroll !== undefined) {
+                            window.Player.postroll = [];
+                        }
+                        
+                        // Очищаем ad-свойства
+                        Object.keys(window.Player).forEach(function (key) {
+                            if (key.toLowerCase().indexOf('ad') !== -1 && 
+                                typeof window.Player[key] === 'object' &&
+                                window.Player[key] !== null) {
+                                window.Player[key] = [];
+                            }
+                        });
+                    } catch (e) {
+                        log('Error cleaning player: ' + e.message);
+                    }
+                    
+                    return orig.apply(this, arguments);
+                };
+                
+                // Сохраняем хук для восстановления
+                playerHooks.push({
+                    method: method,
+                    original: orig
+                });
+                
+                patched.push(method);
             }
-            return orig.apply(this, arguments);
-        };
-        log('XHR перехвачен');
+        });
+        
+        if (patched.length > 0) {
+            log('Player methods patched: ' + patched.join(', '));
+        }
+        
+        return patched;
     }
 
-    // =========================================================
-    //  7. Чистим рекламные таймеры (из второго найденного плагина)
-    //     Запускаем ОДИН РАЗ — не в интервале, чтобы не сломать
-    //     нормальные таймеры плеера
-    // =========================================================
-    function clearAdTimers() {
-        log('Очистка рекламных таймеров...');
-        var highest = setTimeout(function () {}, 0);
-        // Чистим только "старые" таймеры, оставляем свежие (плеер ещё не запустился)
-        for (var i = 1; i < highest - 10; i++) {
-            clearTimeout(i);
+    // =========================
+    // ВОССТАНОВЛЕНИЕ
+    // =========================
+    function restoreFetch() {
+        if (originalFetch) {
+            window.fetch = originalFetch;
+            originalFetch = null;
+            log('Fetch restored');
         }
     }
 
-    // =========================================================
-    //  Инициализация
-    // =========================================================
-    function init() {
-        log('Запуск v' + PLUGIN.version);
-
-        // Запускаем сразу — до любых проверок Lampa
-        patchAccount();
-        patchCreateElement();
-        patchFetch();
-        patchXHR();
-
-        // После загрузки Lampa
-        patchNetwork();
-        patchVideoBlock();
-        patchStorage();
-
-        log('Все блокировщики активны ✓');
-    }
-
-    // =========================================================
-    //  Точка входа
-    // =========================================================
-
-    // Самые ранние патчи — сразу, не ждём Lampa
-    patchAccount();
-    patchCreateElement();
-    patchFetch();
-    patchXHR();
-
-    // Остальное — когда Lampa готова
-    if (window.Lampa && window.Lampa.Listener) {
-        window.Lampa.Listener.follow('ready', function () {
-            patchNetwork();
-            patchVideoBlock();
-            patchStorage();
-            log('Lampa-патчи применены ✓');
+    function restorePlayer() {
+        if (!window.Player) return;
+        
+        playerHooks.forEach(function (hook) {
+            window.Player[hook.method] = hook.original;
         });
-    } else {
-        var attempts = 0;
-        var wait = setInterval(function () {
-            attempts++;
-            if (window.Lampa && window.Lampa.Listener) {
-                clearInterval(wait);
-                window.Lampa.Listener.follow('ready', function () {
-                    patchNetwork();
-                    patchVideoBlock();
-                    patchStorage();
-                    log('Lampa-патчи применены ✓');
-                });
-            } else if (attempts >= 30) {
-                clearInterval(wait);
-                patchNetwork();
-                patchVideoBlock();
-                patchStorage();
-            }
-        }, 100);
+        
+        playerHooks = [];
+        log('Player restored');
     }
 
+    // =========================
+    // УПРАВЛЕНИЕ ПЛАГИНОМ
+    // =========================
+    PLUGIN.disable = function () {
+        this.enabled = false;
+        restoreFetch();
+        restorePlayer();
+        log('Plugin disabled');
+    };
+
+    PLUGIN.enable = function () {
+        this.enabled = true;
+        patchFetch();
+        
+        if (window.Lampa && window.Lampa.Listener) {
+            window.Lampa.Listener.follow('ready', function () {
+                patchAdManager();
+                patchPlayer();
+            });
+        } else {
+            setTimeout(function () {
+                patchAdManager();
+                patchPlayer();
+            }, 2000);
+        }
+        
+        log('Plugin enabled');
+    };
+
+    PLUGIN.toggle = function () {
+        if (this.enabled) {
+            this.disable();
+        } else {
+            this.enable();
+        }
+    };
+
+    // =========================
+    // INIT
+    // =========================
+    function init() {
+        if (isPatched) {
+            log('Already initialized');
+            return;
+        }
+        
+        log('init v' + PLUGIN.version);
+        isPatched = true;
+        
+        PLUGIN.enable();
+    }
+
+    // Запускаем
+    init();
+
+    // Регистрируем в менеджере плагинов
     if (window.plugin_manager) {
         window.plugin_manager.add(PLUGIN);
     }
-
-    log('Ранние патчи применены ✓');
 
 })();
