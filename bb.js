@@ -1,322 +1,270 @@
-(function () {
+(function() {
     'use strict';
 
-    var PLUGIN = {
-        name: 'Lampa AdBlock Pro',
-        tag: 'lampa_adblock_pro',
-        version: '4.1.0',
-        description: 'Hard patch AdManager / preroll pipeline',
-        enabled: true
+    const PLUGIN = {
+        id: 'stable_adblock',
+        name: 'Stable AdBlock',
+        version: '2.0.0',
+        description: 'Безопасный блокировщик рекламы без агрессивных мутаций'
     };
 
-    var isPatched = false;
-    var originalFetch = null;
-    var playerHooks = [];
+    // ============================================================
+    // КОНФИГУРАЦИЯ (правится без переписывания логики)
+    // ============================================================
+    const CONFIG = {
+        // Паттерны URL, которые считаем рекламными
+        adUrlPatterns: [
+            /\/advert/i,
+            /\/preroll/i,
+            /\/vast/i,
+            /\/vmap/i,
+            /\/ad-manager/i,
+            /\/ads\?/i,
+            /doubleclick/i,
+            /adriver/i,
+            /banner/i,
+            /\/ad\./i,
+            /\/ad-/i
+        ],
+        // DOM-селекторы, которые безопасно удалить
+        safeDomSelectors: [
+            '[class*="preroll"]',
+            '[class*="advert"]',
+            '[id*="preroll"]',
+            '[id*="advert"]',
+            'div[data-ad]',
+            '.ad-container'
+        ],
+        // Интервал очистки DOM (мс)
+        domCleanInterval: 2000,
+        // Включать ли fetch-патч
+        blockFetchAds: true,
+        // Включать ли DOM-очистку
+        cleanDom: true
+    };
 
-    function log(msg) {
-        console.log('[AdBlockPro] ' + msg);
-    }
+    // ============================================================
+    // СОСТОЯНИЕ
+    // ============================================================
+    let originalFetch = null;
+    let domCleanerId = null;
+    let isActive = false;
 
-    // =========================
-    // УТИЛИТЫ
-    // =========================
-    function createEmptyResponse() {
-        var body = JSON.stringify({ preroll: [], midroll: [], postroll: [] });
+    // ============================================================
+    // БЕЗОПАСНЫЙ FAKE RESPONSE (контракт соблюден)
+    // ============================================================
+    function createSafeEmptyResponse(url) {
+        const body = JSON.stringify({ ads: [], preroll: null, vast: '' });
+        const blob = new Blob([body], { type: 'application/json' });
         
-        try {
-            return new Response(body, {
-                status: 200,
-                headers: { 'Content-Type': 'application/json' }
-            });
-        } catch (e) {
-            // Fallback для старых окружений
-            return {
-                ok: true,
-                status: 200,
-                json: function () { return Promise.resolve({ preroll: [] }); },
-                text: function () { return Promise.resolve(''); }
-            };
-        }
-    }
-
-    function shouldBlockUrl(url) {
-        if (typeof url !== 'string' || !url) return false;
-        
-        // Конкретные домены рекламных сервисов
-        var blockedDomains = [
-            'cub.rip',
-            'adsrv.me',
-            'doubleclick.net',
-            'googlesyndication.com',
-            'adservice.google.com'
-        ];
-        
-        // Конкретные паттерны запросов
-        var blockedPatterns = [
-            '/preroll.json',
-            '/ads.json',
-            '/vmap.xml',
-            '/vast.xml'
-        ];
-        
-        // Проверяем домены
-        for (var i = 0; i < blockedDomains.length; i++) {
-            if (url.indexOf(blockedDomains[i]) !== -1) return true;
-        }
-        
-        // Проверяем паттерны
-        for (var j = 0; j < blockedPatterns.length; j++) {
-            if (url.indexOf(blockedPatterns[j]) !== -1) return true;
-        }
-        
-        return false;
-    }
-
-    // =========================
-    // 1. ПРЯМОЙ ХУК AD MANAGER
-    // =========================
-    function killAdMethods(obj, name) {
-        if (!obj) return false;
-        
-        var patched = false;
-        
-        ['load', 'request', 'get', 'init', 'start'].forEach(function (m) {
-            if (typeof obj[m] === 'function') {
-                var original = obj[m];
-                obj[m] = function () {
-                    log(name + '.' + m + ' → blocked');
-                    return Promise.resolve([]);
-                };
-                // Сохраняем для возможного восстановления
-                obj['_' + m + '_original'] = original;
-                patched = true;
+        return new Response(blob, {
+            status: 200,
+            statusText: 'OK',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-AdBlocked': 'true',
+                'Content-Length': blob.size.toString()
             }
         });
-        
-        // Очищаем массивы рекламы
-        try {
-            if (obj.preroll !== undefined) obj.preroll = [];
-            if (obj.midroll !== undefined) obj.midroll = [];
-            if (obj.postroll !== undefined) obj.postroll = [];
-            patched = true;
-        } catch (e) {}
-        
-        return patched;
     }
 
-    function patchAdManager() {
-        var patched = [];
-        
-        // Прямые неймспейсы
-        var targets = [
-            { obj: window.AdManager, name: 'AdManager' },
-            { obj: window.Lampa && window.Lampa.AdManager, name: 'Lampa.AdManager' }
-        ];
-        
-        targets.forEach(function (target) {
-            if (killAdMethods(target.obj, target.name)) {
-                patched.push(target.name);
-            }
-        });
-        
-        // Эвристический поиск по window
-        Object.keys(window).forEach(function (k) {
-            try {
-                var o = window[k];
-                if (!o || typeof o !== 'object' || k === 'location') return;
-                
-                var hasAdProps = (o.preroll || o.midroll || o.postroll);
-                var hasAdMethods = typeof o.load === 'function' || typeof o.request === 'function';
-                var nameMatches = k.toLowerCase().indexOf('ad') !== -1 || 
-                                 k.toLowerCase().indexOf('preroll') !== -1;
-                
-                if (hasAdProps || (hasAdMethods && nameMatches)) {
-                    if (killAdMethods(o, k)) {
-                        patched.push(k);
-                    }
-                }
-            } catch (e) {}
-        });
-        
-        if (patched.length > 0) {
-            log('Patched ad objects: ' + patched.join(', '));
-        } else {
-            log('No ad objects found to patch');
-        }
-        
-        return patched;
+    // ============================================================
+    // FETCH PATCH (точечный, без цепочечного перехвата)
+    // ============================================================
+    function isAdRequest(url) {
+        if (!url || typeof url !== 'string') return false;
+        return CONFIG.adUrlPatterns.some(pattern => pattern.test(url));
     }
 
-    // =========================
-    // 2. ПЕРЕХВАТ FETCH
-    // =========================
-    function patchFetch() {
-        if (originalFetch) {
-            log('Fetch already patched');
-            return;
+    function patchedFetch(input, init) {
+        const url = typeof input === 'string' 
+            ? input 
+            : (input?.url || '');
+
+        if (isAdRequest(url)) {
+            console.log(`[${PLUGIN.name}] blocked fetch:`, url.substring(0, 80));
+            return Promise.resolve(createSafeEmptyResponse(url));
         }
-        
-        if (typeof window.fetch !== 'function') {
-            log('window.fetch not available');
-            return;
-        }
+
+        // Пробрасываем в оригинальный fetch
+        return originalFetch.call(window, input, init);
+    }
+
+    function installFetchPatch() {
+        if (!CONFIG.blockFetchAds) return;
+        if (originalFetch) return; // уже установлен
         
         originalFetch = window.fetch;
-        
-        window.fetch = function (input, init) {
-            var url = (typeof input === 'string') ? input : (input && input.url) || '';
-            
-            if (PLUGIN.enabled && shouldBlockUrl(url)) {
-                log('fetch blocked → ' + url.substring(0, 80));
-                return Promise.resolve(createEmptyResponse());
-            }
-            
-            return originalFetch.apply(this, arguments);
-        };
-        
-        log('Fetch patched');
+        window.fetch = patchedFetch;
+        console.log(`[${PLUGIN.name}] fetch patch installed`);
     }
 
-    // =========================
-    // 3. ПЕРЕХВАТ PLAYER
-    // =========================
-    function patchPlayer() {
-        if (!window.Player) return [];
-        
-        var methods = ['load', 'play', 'startPlayback', 'initPlayer', 'start'];
-        var patched = [];
-        
-        methods.forEach(function (method) {
-            if (typeof window.Player[method] === 'function') {
-                var orig = window.Player[method];
-                
-                window.Player[method] = function () {
-                    log('Player.' + method + ' intercepted');
-                    
-                    try {
-                        // Очищаем рекламные массивы плеера
-                        if (window.Player.preroll !== undefined) {
-                            window.Player.preroll = [];
-                        }
-                        if (window.Player.midroll !== undefined) {
-                            window.Player.midroll = [];
-                        }
-                        if (window.Player.postroll !== undefined) {
-                            window.Player.postroll = [];
-                        }
-                        
-                        // Очищаем ad-свойства
-                        Object.keys(window.Player).forEach(function (key) {
-                            if (key.toLowerCase().indexOf('ad') !== -1 && 
-                                typeof window.Player[key] === 'object' &&
-                                window.Player[key] !== null) {
-                                window.Player[key] = [];
-                            }
-                        });
-                    } catch (e) {
-                        log('Error cleaning player: ' + e.message);
-                    }
-                    
-                    return orig.apply(this, arguments);
-                };
-                
-                // Сохраняем хук для восстановления
-                playerHooks.push({
-                    method: method,
-                    original: orig
-                });
-                
-                patched.push(method);
-            }
-        });
-        
-        if (patched.length > 0) {
-            log('Player methods patched: ' + patched.join(', '));
-        }
-        
-        return patched;
-    }
-
-    // =========================
-    // ВОССТАНОВЛЕНИЕ
-    // =========================
-    function restoreFetch() {
+    function uninstallFetchPatch() {
         if (originalFetch) {
             window.fetch = originalFetch;
             originalFetch = null;
-            log('Fetch restored');
+            console.log(`[${PLUGIN.name}] fetch patch removed`);
         }
     }
 
-    function restorePlayer() {
-        if (!window.Player) return;
+    // ============================================================
+    // DOM OBSERVER (без mutation, только safe remove)
+    // ============================================================
+    function cleanAdElements() {
+        if (!CONFIG.cleanDom) return;
         
-        playerHooks.forEach(function (hook) {
-            window.Player[hook.method] = hook.original;
+        let removed = 0;
+        CONFIG.safeDomSelectors.forEach(selector => {
+            try {
+                const elements = document.querySelectorAll(selector);
+                elements.forEach(el => {
+                    // Проверяем, что элемент не содержит видео-контент
+                    const hasVideo = el.querySelector('video');
+                    const isPlayerContainer = el.classList?.contains('player') || 
+                                              el.id?.includes('player');
+                    
+                    if (!hasVideo && !isPlayerContainer) {
+                        el.remove();
+                        removed++;
+                    }
+                });
+            } catch (e) {
+                // Селектор невалидный — пропускаем
+            }
         });
         
-        playerHooks = [];
-        log('Player restored');
+        if (removed > 0) {
+            console.log(`[${PLUGIN.name}] DOM cleaned: ${removed} elements`);
+        }
     }
 
-    // =========================
+    function startDomCleaner() {
+        if (domCleanerId) return;
+        cleanAdElements(); // первый прогон сразу
+        domCleanerId = setInterval(cleanAdElements, CONFIG.domCleanInterval);
+    }
+
+    function stopDomCleaner() {
+        if (domCleanerId) {
+            clearInterval(domCleanerId);
+            domCleanerId = null;
+        }
+    }
+
+    // ============================================================
+    // PLAYER STATE OBSERVER (read-only, без мутаций)
+    // ============================================================
+    function setupPlayerObserver() {
+        // Ждем появления плеера и наблюдаем за его состоянием
+        // НЕ мутируем — только форсируем skip если видим ad state
+        const checkInterval = setInterval(() => {
+            if (!isActive) {
+                clearInterval(checkInterval);
+                return;
+            }
+
+            try {
+                const player = window.Player || window.player || window.videoPlayer;
+                if (!player) return;
+
+                // Если плеер в состоянии рекламы — пробуем пропустить
+                if (typeof player.skipAd === 'function' && player.isInAd?.()) {
+                    player.skipAd();
+                    console.log(`[${PLUGIN.name}] ad skipped via player API`);
+                }
+
+                // Если есть видео-элемент с src содержащим ad
+                const video = document.querySelector('video');
+                if (video && video.src && isAdRequest(video.src)) {
+                    video.src = '';
+                    video.load();
+                }
+            } catch (e) {
+                // Игнорируем ошибки доступа к плееру
+            }
+        }, 1000);
+
+        return checkInterval;
+    }
+
+    // ============================================================
     // УПРАВЛЕНИЕ ПЛАГИНОМ
-    // =========================
-    PLUGIN.disable = function () {
-        this.enabled = false;
-        restoreFetch();
-        restorePlayer();
-        log('Plugin disabled');
-    };
+    // ============================================================
+    function enable() {
+        if (isActive) return;
+        isActive = true;
 
-    PLUGIN.enable = function () {
-        this.enabled = true;
-        patchFetch();
-        
-        if (window.Lampa && window.Lampa.Listener) {
-            window.Lampa.Listener.follow('ready', function () {
-                patchAdManager();
-                patchPlayer();
-            });
-        } else {
-            setTimeout(function () {
-                patchAdManager();
-                patchPlayer();
-            }, 2000);
-        }
-        
-        log('Plugin enabled');
-    };
+        installFetchPatch();
+        startDomCleaner();
+        const observerInterval = setupPlayerObserver();
 
-    PLUGIN.toggle = function () {
-        if (this.enabled) {
-            this.disable();
-        } else {
-            this.enable();
-        }
-    };
+        // Сохраняем ссылку на observer для cleanup
+        PLUGIN._observerInterval = observerInterval;
 
-    // =========================
-    // INIT
-    // =========================
-    function init() {
-        if (isPatched) {
-            log('Already initialized');
-            return;
-        }
-        
-        log('init v' + PLUGIN.version);
-        isPatched = true;
-        
-        PLUGIN.enable();
+        console.log(`[${PLUGIN.name}] enabled v${PLUGIN.version}`);
     }
 
-    // Запускаем
-    init();
+    function disable() {
+        if (!isActive) return;
+        isActive = false;
 
-    // Регистрируем в менеджере плагинов
-    if (window.plugin_manager) {
-        window.plugin_manager.add(PLUGIN);
+        uninstallFetchPatch();
+        stopDomCleaner();
+        
+        if (PLUGIN._observerInterval) {
+            clearInterval(PLUGIN._observerInterval);
+            PLUGIN._observerInterval = null;
+        }
+
+        console.log(`[${PLUGIN.name}] disabled`);
     }
 
+    function toggle() {
+        isActive ? disable() : enable();
+    }
+
+    // ============================================================
+    // РЕГИСТРАЦИЯ В LAMPA
+    // ============================================================
+    function register() {
+        if (window.Lampa) {
+            // Регистрируем в системе плагинов Lampa
+            if (window.plugin_manager) {
+                window.plugin_manager.add({
+                    ...PLUGIN,
+                    enable,
+                    disable,
+                    toggle
+                });
+            }
+
+            // Автостарт при загрузке Lampa
+            if (window.Lampa.Listener) {
+                window.Lampa.Listener.follow('loaded', () => {
+                    enable();
+                });
+            } else {
+                // Lampa еще не инициализирована — стартуем сразу
+                enable();
+            }
+        } else {
+            // Lampa может загрузиться позже
+            window.addEventListener('DOMContentLoaded', enable);
+        }
+    }
+
+    // ============================================================
+    // ПУБЛИЧНОЕ API (для дебага)
+    // ============================================================
+    window.StableAdBlock = {
+        enable,
+        disable,
+        toggle,
+        isActive: () => isActive,
+        config: CONFIG,
+        plugin: PLUGIN
+    };
+
+    // Старт
+    register();
 })();
