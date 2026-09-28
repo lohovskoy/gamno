@@ -7,42 +7,30 @@
         console.log('[' + NAME + ']', arguments);
     }
 
-    // Для сетевых запросов (fetch/XHR) — блокируем по этим паттернам
-    var ADS_NET = [
-        'bid.ctv.house',
-        'betweendigital',
-        'preroll', 'midroll', 'postroll',
-        'vast', 'vmap',
-        'doubleclick', 'googlesyndication',
-        'adriver', 'begun.ru', 'smi2',
-        'adservice', '/advert', '/adv/'
-    ];
-
-    // Для video.src — ТОЛЬКО явные рекламные домены
-    // Короткие паттерны типа '/adv' убраны — они совпадают с нормальными URL
-    var ADS_VIDEO = [
-        'bid.ctv.house',
-        'betweendigital',
+    // Блокируем только сетевые запросы к рекламным доменам.
+    // Реклама в Lampa запускается только при старте видео через XHR к этим доменам —
+    // если запрос не прошёл, VAST не получен, preroll не запускается.
+    var ADS = [
+        'bid.ctv.house',       // основной рекламный сервер из логов
+        'betweendigital',      // второй рекламный сервер из логов
+        'preroll',             // универсальный паттерн
+        'midroll',
+        'postroll',
+        'vast', 'vmap',        // форматы рекламных манифестов
         'doubleclick',
         'googlesyndication',
         'adriver',
-        'vast', 'vmap'
+        'begun.ru',
+        'smi2',
+        'adservice',
+        '/advert'
     ];
 
-    function isAdNet(str) {
+    function isAd(str) {
         if (!str) return false;
         str = String(str).toLowerCase();
-        for (var i = 0; i < ADS_NET.length; i++) {
-            if (str.indexOf(ADS_NET[i]) !== -1) return true;
-        }
-        return false;
-    }
-
-    function isAdVideo(str) {
-        if (!str) return false;
-        str = String(str).toLowerCase();
-        for (var i = 0; i < ADS_VIDEO.length; i++) {
-            if (str.indexOf(ADS_VIDEO[i]) !== -1) return true;
+        for (var i = 0; i < ADS.length; i++) {
+            if (str.indexOf(ADS[i]) !== -1) return true;
         }
         return false;
     }
@@ -54,18 +42,17 @@
         if (!window.fetch) return;
         var _fetch = window.fetch;
         window.fetch = function () {
-            var args = arguments;
             var url = '';
             try {
-                url = typeof args[0] === 'string'
-                    ? args[0]
-                    : (args[0] && args[0].url ? args[0].url : '');
+                url = typeof arguments[0] === 'string'
+                    ? arguments[0]
+                    : (arguments[0] && arguments[0].url ? arguments[0].url : '');
             } catch (e) {}
-            if (url && isAdNet(url)) {
+            if (url && isAd(url)) {
                 log('BLOCK FETCH', url);
                 return Promise.resolve(new Response('', { status: 204 }));
             }
-            return _fetch.apply(this, args);
+            return _fetch.apply(this, arguments);
         };
     }
 
@@ -80,7 +67,7 @@
             return open.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function () {
-            if (this._url && isAdNet(this._url)) {
+            if (this._url && isAd(this._url)) {
                 log('BLOCK XHR', this._url);
                 try { this.abort(); } catch (e) {}
                 return;
@@ -90,69 +77,19 @@
     }
 
     // =========================================================
-    // BEACON
+    // BEACON — трекинг показов рекламы
     // =========================================================
     function patchBeacon() {
         if (!navigator.sendBeacon) return;
         var orig = navigator.sendBeacon;
         navigator.sendBeacon = function (url, data) {
-            if (isAdNet(url)) { log('BLOCK BEACON', url); return true; }
+            if (isAd(url)) { log('BLOCK BEACON', url); return true; }
             return orig.apply(navigator, arguments);
         };
     }
 
     // =========================================================
-    // VIDEO WATCHER — проверяем только по явным рекламным доменам
-    // =========================================================
-    function watchVideo() {
-        setInterval(function () {
-            var v = document.querySelector('video');
-            if (!v) return;
-            try {
-                if (v.src && isAdVideo(v.src)) {
-                    log('VIDEO SRC BLOCK', v.src);
-                    v.pause();
-                    v.removeAttribute('src');
-                    v.load();
-                }
-                var skip = document.querySelector(
-                    '.skip-button,.skip-ad,[class*="skip"],[id*="skip"]'
-                );
-                if (skip) { skip.click(); log('SKIP'); }
-            } catch (e) {}
-        }, 800);
-    }
-
-    // =========================================================
-    // DOM CLEANER
-    // =========================================================
-    function domClean() {
-        var obs = new MutationObserver(function (mutations) {
-            for (var i = 0; i < mutations.length; i++) {
-                var nodes = mutations[i].addedNodes;
-                for (var j = 0; j < nodes.length; j++) {
-                    var n = nodes[j];
-                    if (!n || !n.tagName) continue;
-                    var cls = (n.className || '').toString().toLowerCase();
-                    var id  = (n.id || '').toLowerCase();
-                    if (
-                        cls.indexOf('preroll') !== -1 ||
-                        cls.indexOf('midroll') !== -1 ||
-                        cls.indexOf('advert')  !== -1 ||
-                        id.indexOf('preroll')  !== -1
-                    ) {
-                        try { n.remove(); log('REMOVE NODE'); } catch (e) {}
-                    }
-                }
-            }
-        });
-        if (document.documentElement) {
-            obs.observe(document.documentElement, { childList: true, subtree: true });
-        }
-    }
-
-    // =========================================================
-    // CSS
+    // CSS — скрываем рекламные оверлеи если вдруг появятся
     // =========================================================
     function css() {
         if (!document.head) return;
@@ -169,23 +106,22 @@
     // INIT
     // =========================================================
     function init() {
-        log('INIT');
+        log('INIT v2.0');
         patchFetch();
         patchXHR();
         patchBeacon();
-        watchVideo();
-        domClean();
         css();
+        log('Готов — watchVideo убран, только сетевая блокировка');
     }
 
     // =========================================================
-    // REGISTER — как в bb.js
+    // REGISTER
     // =========================================================
     if (window.Lampa && Lampa.Plugin) {
         Lampa.Plugin.add({
             name: NAME,
-            version: '1.1',
-            description: 'Ad blocker',
+            version: '2.0',
+            description: 'Ad blocker — network only',
             init: init
         });
     } else {
