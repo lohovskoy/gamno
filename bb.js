@@ -20,12 +20,16 @@
     //  НЕ включаем: 'ad','ads','banner','tracking' — ломают источники
     // =========================================================
     var ADS_NET = [
+        // Точные домены из логов — самое надёжное
+        'bid.ctv.house',          // XHR: bid.ctv.house/ads/tag?...preroll
+        'ads.betweendigital.com', // XHR: ads.betweendigital.com/adv?...preroll
+        'cub.best/api/metric/stat?method=ad_', // трекинг рекламы cub
+        // Универсальные рекламные паттерны
         'preroll', 'midroll', 'postroll',
         'vast', 'vmap',
         'doubleclick', 'googlesyndication',
         'adriver.ru', 'begun.ru', 'smi2.ru',
-        'adservice', '/advert', '/adv/',
-        'netfix', '/cub/'
+        'adservice', '/advert', '/adv/'
     ];
 
     var ADS_VIDEO = [
@@ -33,7 +37,7 @@
         'vast', 'vmap', '/advert', '/adv',
         'doubleclick', 'googlesyndication',
         'adriver', 'begun', 'smi2',
-        'netfix', '/cub/'
+        'bid.ctv.house', 'betweendigital'
     ];
 
     function isAdNet(str) {
