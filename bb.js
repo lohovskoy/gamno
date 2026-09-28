@@ -7,11 +7,8 @@
         console.log('[' + NAME + ']', arguments);
     }
 
-    // =========================================================
-    // Точные домены из логов + универсальные паттерны
-    // НЕ используем: 'ad','ads','banner','tracking' — ломают источники
-    // =========================================================
-    var ADS = [
+    // Для сетевых запросов (fetch/XHR) — блокируем по этим паттернам
+    var ADS_NET = [
         'bid.ctv.house',
         'betweendigital',
         'preroll', 'midroll', 'postroll',
@@ -21,11 +18,31 @@
         'adservice', '/advert', '/adv/'
     ];
 
-    function isAd(str) {
+    // Для video.src — ТОЛЬКО явные рекламные домены
+    // Короткие паттерны типа '/adv' убраны — они совпадают с нормальными URL
+    var ADS_VIDEO = [
+        'bid.ctv.house',
+        'betweendigital',
+        'doubleclick',
+        'googlesyndication',
+        'adriver',
+        'vast', 'vmap'
+    ];
+
+    function isAdNet(str) {
         if (!str) return false;
         str = String(str).toLowerCase();
-        for (var i = 0; i < ADS.length; i++) {
-            if (str.indexOf(ADS[i]) !== -1) return true;
+        for (var i = 0; i < ADS_NET.length; i++) {
+            if (str.indexOf(ADS_NET[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    function isAdVideo(str) {
+        if (!str) return false;
+        str = String(str).toLowerCase();
+        for (var i = 0; i < ADS_VIDEO.length; i++) {
+            if (str.indexOf(ADS_VIDEO[i]) !== -1) return true;
         }
         return false;
     }
@@ -44,7 +61,7 @@
                     ? args[0]
                     : (args[0] && args[0].url ? args[0].url : '');
             } catch (e) {}
-            if (url && isAd(url)) {
+            if (url && isAdNet(url)) {
                 log('BLOCK FETCH', url);
                 return Promise.resolve(new Response('', { status: 204 }));
             }
@@ -63,7 +80,7 @@
             return open.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function () {
-            if (this._url && isAd(this._url)) {
+            if (this._url && isAdNet(this._url)) {
                 log('BLOCK XHR', this._url);
                 try { this.abort(); } catch (e) {}
                 return;
@@ -79,21 +96,21 @@
         if (!navigator.sendBeacon) return;
         var orig = navigator.sendBeacon;
         navigator.sendBeacon = function (url, data) {
-            if (isAd(url)) { log('BLOCK BEACON', url); return true; }
+            if (isAdNet(url)) { log('BLOCK BEACON', url); return true; }
             return orig.apply(navigator, arguments);
         };
     }
 
     // =========================================================
-    // VIDEO WATCHER
+    // VIDEO WATCHER — проверяем только по явным рекламным доменам
     // =========================================================
     function watchVideo() {
         setInterval(function () {
             var v = document.querySelector('video');
             if (!v) return;
             try {
-                if (v.src && isAd(v.src)) {
-                    log('VIDEO SRC BLOCK');
+                if (v.src && isAdVideo(v.src)) {
+                    log('VIDEO SRC BLOCK', v.src);
                     v.pause();
                     v.removeAttribute('src');
                     v.load();
@@ -162,12 +179,12 @@
     }
 
     // =========================================================
-    // REGISTER — точно как в bb.js через Lampa.Plugin.add
+    // REGISTER — как в bb.js
     // =========================================================
     if (window.Lampa && Lampa.Plugin) {
         Lampa.Plugin.add({
             name: NAME,
-            version: '1.0',
+            version: '1.1',
             description: 'Ad blocker',
             init: init
         });
