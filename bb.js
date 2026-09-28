@@ -253,14 +253,30 @@
     // =========================================================
     //  7. Account.hasPremium
     // =========================================================
+    function defineForce(obj, prop, value) {
+        try {
+            // Пробуем обычное присвоение
+            obj[prop] = value;
+        } catch (e) {}
+        try {
+            // Если свойство read-only — переопределяем принудительно
+            Object.defineProperty(obj, prop, {
+                get: function () { return value; },
+                set: function () {},
+                configurable: true
+            });
+        } catch (e) {}
+    }
+
     function patchAccount() {
         window.Account = window.Account || {};
-        window.Account.hasPremium = function () { return true; };
-        window.Account.isPremium  = function () { return true; };
-        window.Account.premium    = true;
+        defineForce(window.Account, 'hasPremium', function () { return true; });
+        defineForce(window.Account, 'isPremium',  function () { return true; });
+        defineForce(window.Account, 'premium',    true);
         if (Lampa && Lampa.Account) {
-            Lampa.Account.hasPremium = function () { return true; };
-            Lampa.Account.isPremium  = function () { return true; };
+            defineForce(Lampa.Account, 'hasPremium', function () { return true; });
+            defineForce(Lampa.Account, 'isPremium',  function () { return true; });
+            defineForce(Lampa.Account, 'premium',    true);
         }
         log('Account.hasPremium → true');
     }
