@@ -9,16 +9,15 @@
     }
 
     // =========================================================
-    //  Проверка поддержки Proxy (старые Smart TV не поддерживают)
+    //  Проверка Proxy
     // =========================================================
     var PROXY_SUPPORTED = (function () {
         try { new Proxy({}, {}); return true; } catch (e) { return false; }
     })();
 
-    log('Proxy поддерживается:', PROXY_SUPPORTED);
-
     // =========================================================
-    //  Ключевые слова
+    //  Ключевые слова — только явно рекламные
+    //  НЕ включаем: 'ad','ads','banner','tracking' — ломают источники
     // =========================================================
     var ADS_NET = [
         'preroll', 'midroll', 'postroll',
@@ -26,15 +25,15 @@
         'doubleclick', 'googlesyndication',
         'adriver.ru', 'begun.ru', 'smi2.ru',
         'adservice', '/advert', '/adv/',
-        'netfix', 'cub'          // ← из лога: "run netfix_two from cub"
+        'netfix', '/cub/'
     ];
 
     var ADS_VIDEO = [
         'preroll', 'midroll', 'postroll',
-        'vast', 'vmap', 'advert', '/adv',
+        'vast', 'vmap', '/advert', '/adv',
         'doubleclick', 'googlesyndication',
         'adriver', 'begun', 'smi2',
-        'netfix', 'cub'
+        'netfix', '/cub/'
     ];
 
     function isAdNet(str) {
@@ -56,21 +55,16 @@
     }
 
     // =========================================================
-    //  Флаг сетевой блокировки — только в плеере
-    // =========================================================
-    var networkBlockActive = false;
-
-    // =========================================================
     //  Оригиналы
     // =========================================================
-    var _fetch   = window.fetch   ? window.fetch.bind(window)       : null;
-    var _xhrOpen = XMLHttpRequest.prototype.open;
-    var _xhrSend = XMLHttpRequest.prototype.send;
-    var _beacon  = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
+    var _fetch         = window.fetch ? window.fetch.bind(window) : null;
+    var _xhrOpen       = XMLHttpRequest.prototype.open;
+    var _xhrSend       = XMLHttpRequest.prototype.send;
+    var _beacon        = navigator.sendBeacon ? navigator.sendBeacon.bind(navigator) : null;
     var _createElement = document.createElement.bind(document);
 
     // =========================================================
-    //  1. FETCH
+    //  1. FETCH — блокируем всегда (не ждём плеера)
     // =========================================================
     function patchFetch() {
         if (!_fetch) return;
@@ -82,8 +76,7 @@
                     ? args[0]
                     : (args[0] && args[0].url ? args[0].url : '');
             } catch (e) {}
-
-            if (networkBlockActive && url && isAdNet(url)) {
+            if (url && isAdNet(url)) {
                 log('BLOCK FETCH', url);
                 return Promise.resolve(new Response('', { status: 204 }));
             }
@@ -93,7 +86,7 @@
     }
 
     // =========================================================
-    //  2. XHR
+    //  2. XHR — блокируем всегда
     // =========================================================
     function patchXHR() {
         XMLHttpRequest.prototype.open = function (m, url) {
@@ -101,7 +94,7 @@
             return _xhrOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function () {
-            if (networkBlockActive && this._adblock_url && isAdNet(this._adblock_url)) {
+            if (this._adblock_url && isAdNet(this._adblock_url)) {
                 log('BLOCK XHR', this._adblock_url);
                 try { this.abort(); } catch (e) {}
                 return;
@@ -124,38 +117,10 @@
     }
 
     // =========================================================
-    //  4. createElement — БЕЗ Proxy, совместимо со старыми TV
-    //     Переопределяем напрямую через обычную функцию
+    //  4. createElement — перехват рекламного <video>
     // =========================================================
-    function patchCreateElement() {
-        if (PROXY_SUPPORTED) {
-            // Современные устройства — через Proxy (надёжнее)
-            document.createElement = new Proxy(document.createElement, {
-                apply: function (target, thisArg, args) {
-                    var el = target.apply(thisArg, args);
-                    if ((args[0] || '').toLowerCase() === 'video') {
-                        wrapVideoElement(el);
-                    }
-                    return el;
-                }
-            });
-            log('createElement Proxy установлен');
-        } else {
-            // Старые Smart TV — обычное переопределение
-            document.createElement = function (tag) {
-                var el = _createElement(tag);
-                if ((tag || '').toLowerCase() === 'video') {
-                    wrapVideoElement(el);
-                }
-                return el;
-            };
-            log('createElement патч установлен (без Proxy)');
-        }
-    }
-
     function wrapVideoElement(video) {
         var _play = video.play ? video.play.bind(video) : null;
-
         video.play = function () {
             if (video.src && isAdVideo(video.src)) {
                 log('BLOCK video.play src:', video.src);
@@ -164,7 +129,6 @@
             }
             return _play ? _play() : undefined;
         };
-
         var _setAttr = video.setAttribute ? video.setAttribute.bind(video) : null;
         video.setAttribute = function (name, value) {
             if (name === 'src' && isAdVideo(value)) {
@@ -185,52 +149,35 @@
         }, 100);
     }
 
-    // =========================================================
-    //  5. Патч внутреннего Ad-менеджера Lampa
-    //     Из лога видно: [Ad] manager preroll filter view
-    //     Lampa хранит Ad-менеджер — найдём и заглушим
-    // =========================================================
-    function patchAdManager() {
-        // Ищем объект с методами preroll / manager в window
-        try {
-            Object.keys(window).forEach(function (key) {
-                var obj = window[key];
-                if (!obj || typeof obj !== 'object') return;
-
-                // Ищем по наличию методов рекламного менеджера
-                if (typeof obj.preroll === 'function' || typeof obj.manager === 'function') {
-                    if (typeof obj.preroll === 'function') {
-                        obj.preroll = function () { log('Ad.preroll заглушён'); };
-                    }
-                    if (typeof obj.manager === 'function') {
-                        obj.manager = function () { log('Ad.manager заглушён'); };
-                    }
-                    log('Ad-менеджер заглушён:', key);
+    function patchCreateElement() {
+        if (PROXY_SUPPORTED) {
+            document.createElement = new Proxy(document.createElement, {
+                apply: function (target, thisArg, args) {
+                    var el = target.apply(thisArg, args);
+                    if ((args[0] || '').toLowerCase() === 'video') wrapVideoElement(el);
+                    return el;
                 }
             });
-        } catch (e) {}
-
-        // Также патчим через Lampa напрямую
-        if (Lampa && Lampa.Ad) {
-            if (typeof Lampa.Ad.preroll === 'function') {
-                Lampa.Ad.preroll = function () { log('Lampa.Ad.preroll заглушён'); };
-            }
-            if (typeof Lampa.Ad.manager === 'function') {
-                Lampa.Ad.manager = function () { log('Lampa.Ad.manager заглушён'); };
-            }
-            log('Lampa.Ad заглушён');
+            log('createElement Proxy установлен');
+        } else {
+            document.createElement = function (tag) {
+                var el = _createElement(tag);
+                if ((tag || '').toLowerCase() === 'video') wrapVideoElement(el);
+                return el;
+            };
+            log('createElement патч установлен (без Proxy)');
         }
     }
 
     // =========================================================
-    //  6. network.silent
+    //  5. network.silent — внутренний метод Lampa
     // =========================================================
     function patchNetwork() {
         var targets = [window.network, Lampa && Lampa.Network].filter(Boolean);
         targets.forEach(function (net) {
             if (net && typeof net.silent === 'function') {
                 net.silent = function (url, ok) {
-                    log('network.silent:', url);
+                    log('network.silent перехвачен:', url);
                     if (typeof ok === 'function') ok([]);
                 };
             }
@@ -251,38 +198,33 @@
     }
 
     // =========================================================
-    //  7. Account.hasPremium
+    //  6. Ad-менеджер Lampa
     // =========================================================
-    function defineForce(obj, prop, value) {
+    function patchAdManager() {
+        if (Lampa && Lampa.Ad) {
+            if (typeof Lampa.Ad.preroll === 'function') {
+                Lampa.Ad.preroll = function () { log('Lampa.Ad.preroll заглушён'); };
+            }
+            if (typeof Lampa.Ad.manager === 'function') {
+                Lampa.Ad.manager = function () { log('Lampa.Ad.manager заглушён'); };
+            }
+            log('Lampa.Ad заглушён');
+        }
         try {
-            // Пробуем обычное присвоение
-            obj[prop] = value;
-        } catch (e) {}
-        try {
-            // Если свойство read-only — переопределяем принудительно
-            Object.defineProperty(obj, prop, {
-                get: function () { return value; },
-                set: function () {},
-                configurable: true
+            Object.keys(window).forEach(function (key) {
+                var obj = window[key];
+                if (!obj || typeof obj !== 'object') return;
+                if (typeof obj.preroll === 'function' || typeof obj.manager === 'function') {
+                    if (typeof obj.preroll === 'function') obj.preroll = function () {};
+                    if (typeof obj.manager === 'function') obj.manager = function () {};
+                    log('Ad-менеджер заглушён:', key);
+                }
             });
         } catch (e) {}
     }
 
-    function patchAccount() {
-        window.Account = window.Account || {};
-        defineForce(window.Account, 'hasPremium', function () { return true; });
-        defineForce(window.Account, 'isPremium',  function () { return true; });
-        defineForce(window.Account, 'premium',    true);
-        if (Lampa && Lampa.Account) {
-            defineForce(Lampa.Account, 'hasPremium', function () { return true; });
-            defineForce(Lampa.Account, 'isPremium',  function () { return true; });
-            defineForce(Lampa.Account, 'premium',    true);
-        }
-        log('Account.hasPremium → true');
-    }
-
     // =========================================================
-    //  8. VideoBlock stub
+    //  7. VideoBlock stub
     // =========================================================
     function patchVideoBlock() {
         function Stub() {}
@@ -312,7 +254,7 @@
     }
 
     // =========================================================
-    //  9. Storage
+    //  8. Storage
     // =========================================================
     function patchStorage() {
         if (!Lampa || !Lampa.Storage) return;
@@ -326,22 +268,19 @@
     }
 
     // =========================================================
-    //  10. Video watcher + DOM cleaner (только в плеере)
+    //  9. Video watcher — постоянный как в bb.js
     // =========================================================
-    var videoInterval = null;
-    var domObserver   = null;
-
-    function startVideoWatch() {
-        if (videoInterval) return;
-        videoInterval = setInterval(function () {
+    function watchVideo() {
+        setInterval(function () {
             var v = document.querySelector('video');
-            if (!v || !v.src) return;
+            if (!v) return;
             try {
-                if (isAdVideo(v.src)) {
+                if (v.src && isAdVideo(v.src)) {
                     log('VIDEO SRC BLOCK');
                     v.pause();
                     v.removeAttribute('src');
                     v.load();
+                    return;
                 }
                 var skip = document.querySelector(
                     '.skip-button,.skip-ad,[class*="skip"],[id*="skip"]'
@@ -351,13 +290,11 @@
         }, 800);
     }
 
-    function stopVideoWatch() {
-        if (videoInterval) { clearInterval(videoInterval); videoInterval = null; }
-    }
-
-    function startDomClean() {
-        if (domObserver) return;
-        domObserver = new MutationObserver(function (mutations) {
+    // =========================================================
+    //  10. DOM cleaner — постоянный
+    // =========================================================
+    function domClean() {
+        var obs = new MutationObserver(function (mutations) {
             for (var i = 0; i < mutations.length; i++) {
                 var nodes = mutations[i].addedNodes;
                 for (var j = 0; j < nodes.length; j++) {
@@ -369,16 +306,15 @@
                         cls.indexOf('midroll') !== -1 ||
                         cls.indexOf('advert')  !== -1
                     ) {
-                        try { n.remove(); } catch (e) {}
+                        try { n.remove(); log('DOM удалён:', cls); } catch (e) {}
                     }
                 }
             }
         });
-        domObserver.observe(document.documentElement, { childList: true, subtree: true });
-    }
-
-    function stopDomClean() {
-        if (domObserver) { domObserver.disconnect(); domObserver = null; }
+        if (document.documentElement) {
+            obs.observe(document.documentElement, { childList: true, subtree: true });
+        }
+        log('DOM observer запущен');
     }
 
     // =========================================================
@@ -390,41 +326,14 @@
             '.preroll,.midroll,.video-ads,.advert{' +
             'display:none!important;opacity:0!important;pointer-events:none!important}';
         document.head.appendChild(style);
-    }
-
-    // =========================================================
-    //  События плеера
-    // =========================================================
-    function activateForPlayer() {
-        log('▶ Плеер открыт');
-        networkBlockActive = true;
-        startVideoWatch();
-        startDomClean();
-    }
-
-    function deactivateForPlayer() {
-        log('■ Плеер закрыт');
-        networkBlockActive = false;
-        stopVideoWatch();
-        stopDomClean();
-    }
-
-    function bindLampaEvents() {
-        if (!Lampa || !Lampa.Listener) return;
-        Lampa.Listener.follow('player:open',    activateForPlayer);
-        Lampa.Listener.follow('player:video',   activateForPlayer);
-        Lampa.Listener.follow('player:start',   activateForPlayer);
-        Lampa.Listener.follow('player:close',   deactivateForPlayer);
-        Lampa.Listener.follow('player:destroy', deactivateForPlayer);
-        Lampa.Listener.follow('player:end',     deactivateForPlayer);
-        log('Lampa события привязаны');
+        log('CSS инжектирован');
     }
 
     // =========================================================
     //  INIT
     // =========================================================
     function init() {
-        log('INIT v3.3');
+        log('INIT v3.4');
         patchFetch();
         patchXHR();
         patchBeacon();
@@ -432,13 +341,13 @@
         patchVideoBlock();
         patchAdManager();
         patchStorage();
+        watchVideo();
+        domClean();
         injectCSS();
-        bindLampaEvents();
-        log('Готов ✓');
+        log('Все патчи активны ✓');
     }
 
-    // Самые ранние патчи — до Lampa
-    patchAccount();
+    // createElement патчим сразу — максимально рано
     patchCreateElement();
 
     if (Lampa && Lampa.Listener) {
@@ -457,7 +366,7 @@
     }
 
     if (window.plugin_manager) {
-        window.plugin_manager.add({ name: NAME, version: '3.3', tag: 'lampa_adblock' });
+        window.plugin_manager.add({ name: NAME, version: '3.4', tag: 'lampa_adblock' });
     }
 
 })(window.Lampa);
