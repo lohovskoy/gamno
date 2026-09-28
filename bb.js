@@ -7,23 +7,14 @@
         console.log('[' + NAME + ']', arguments);
     }
 
-    // Блокируем только сетевые запросы к рекламным доменам.
-    // Реклама в Lampa запускается только при старте видео через XHR к этим доменам —
-    // если запрос не прошёл, VAST не получен, preroll не запускается.
     var ADS = [
-        'bid.ctv.house',       // основной рекламный сервер из логов
-        'betweendigital',      // второй рекламный сервер из логов
-        'preroll',             // универсальный паттерн
-        'midroll',
-        'postroll',
-        'vast', 'vmap',        // форматы рекламных манифестов
-        'doubleclick',
-        'googlesyndication',
-        'adriver',
-        'begun.ru',
-        'smi2',
-        'adservice',
-        '/advert'
+        'bid.ctv.house',
+        'betweendigital',
+        'preroll', 'midroll', 'postroll',
+        'vast', 'vmap',
+        'doubleclick', 'googlesyndication',
+        'adriver', 'begun.ru', 'smi2',
+        'adservice', '/advert'
     ];
 
     function isAd(str) {
@@ -35,9 +26,6 @@
         return false;
     }
 
-    // =========================================================
-    // FETCH
-    // =========================================================
     function patchFetch() {
         if (!window.fetch) return;
         var _fetch = window.fetch;
@@ -56,9 +44,6 @@
         };
     }
 
-    // =========================================================
-    // XHR
-    // =========================================================
     function patchXHR() {
         var open = XMLHttpRequest.prototype.open;
         var send = XMLHttpRequest.prototype.send;
@@ -76,9 +61,6 @@
         };
     }
 
-    // =========================================================
-    // BEACON — трекинг показов рекламы
-    // =========================================================
     function patchBeacon() {
         if (!navigator.sendBeacon) return;
         var orig = navigator.sendBeacon;
@@ -88,40 +70,28 @@
         };
     }
 
-    // =========================================================
-    // CSS — скрываем рекламные оверлеи если вдруг появятся
-    // =========================================================
     function css() {
         if (!document.head) return;
         var style = document.createElement('style');
         style.innerHTML =
             '.preroll,.midroll,.video-ads,.advert{' +
-            'display:none!important;' +
-            'opacity:0!important;' +
-            'pointer-events:none!important}';
+            'display:none!important;opacity:0!important;pointer-events:none!important}';
         document.head.appendChild(style);
     }
 
-    // =========================================================
-    // INIT
-    // =========================================================
     function init() {
-        log('INIT v2.0');
+        log('INIT v2.1');
         patchFetch();
         patchXHR();
         patchBeacon();
         css();
-        log('Готов — watchVideo убран, только сетевая блокировка');
     }
 
-    // =========================================================
-    // REGISTER
-    // =========================================================
     if (window.Lampa && Lampa.Plugin) {
         Lampa.Plugin.add({
             name: NAME,
-            version: '2.0',
-            description: 'Ad blocker — network only',
+            version: '2.1',
+            description: 'Ad blocker',
             init: init
         });
     } else {
